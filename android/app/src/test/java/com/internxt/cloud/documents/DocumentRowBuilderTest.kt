@@ -29,16 +29,6 @@ class DocumentRowBuilderTest {
     )
 
     @Test
-    fun fileRowsAdvertiseWrite() {
-        val flags = DocumentRowBuilder.fileRow(driveFile(REPORT_PDF, "pdf"))[Document.COLUMN_FLAGS] as Int
-        assertEquals(
-            "file rows must advertise write support",
-            Document.FLAG_SUPPORTS_WRITE,
-            flags and Document.FLAG_SUPPORTS_WRITE,
-        )
-    }
-
-    @Test
     fun folderRowsDoNotAdvertiseWrite() {
         val folder = DriveFolder(
             uuid = "folder-uuid",
@@ -104,7 +94,8 @@ class DocumentRowBuilderTest {
         assertEquals(1768089600000L, row[Document.COLUMN_LAST_MODIFIED])
         val expectedFileFlags = Document.FLAG_SUPPORTS_RENAME or
             Document.FLAG_SUPPORTS_DELETE or
-            Document.FLAG_SUPPORTS_MOVE
+            Document.FLAG_SUPPORTS_MOVE or
+            Document.FLAG_SUPPORTS_WRITE
         assertEquals(expectedFileFlags, row[Document.COLUMN_FLAGS])
         assertEquals(102400L, row[Document.COLUMN_SIZE])
         assertEquals(PARENT_UUID, row[DocumentRowBuilder.COLUMN_PARENT_UUID])

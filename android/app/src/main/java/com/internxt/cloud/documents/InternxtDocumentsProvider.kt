@@ -20,6 +20,7 @@ import com.internxt.cloud.documents.api.AuthConfig
 import com.internxt.cloud.documents.api.InternxtApiClient
 import com.internxt.cloud.documents.api.InternxtApiException
 import com.internxt.cloud.documents.api.model.CreateFileEntry
+import com.internxt.cloud.documents.api.model.DriveFile
 import com.internxt.cloud.documents.api.model.FinishUploadShard
 import com.internxt.cloud.documents.api.model.TrashItem
 import com.internxt.cloud.documents.api.model.UploadSlot
@@ -43,7 +44,6 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +51,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.coroutineContext
 
 class InternxtDocumentsProvider : DocumentsProvider() {
@@ -67,11 +69,12 @@ class InternxtDocumentsProvider : DocumentsProvider() {
     private val documentRows = DocumentRowCache()
 
     /**
-     * Documents currently open for writing, keyed by file uuid. Two writers on
-     * one file race: whichever replaces last wins, so a slow save can land on
-     * top of a newer one. Admitting one at a time removes that.
+     * Serialises replacements per file. Two clients saving the same document at
+     * once would otherwise race, and the slower upload could land on top of the
+     * newer one. Queuing rather than refusing matters because an ordinary
+     * editor opens to read, closes, then opens again to save.
      */
-    private val activeEdits = ConcurrentHashMap<String, Long>()
+    private val editLocks = ConcurrentHashMap<String, Mutex>()
     private val pendingUploads = ConcurrentHashMap<String, PendingUpload>()
 
     @Volatile private var cachedRootBucket: String? = null
@@ -517,7 +520,21 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         val id = documentId ?: throw FileNotFoundException("No document id")
         val effectiveMode = mode ?: "r"
         if (effectiveMode.contains('w') || effectiveMode.contains('a')) {
-            return openForWrite(ctx, id, effectiveMode, signal)
+            // The read path below normalises failures into FileNotFoundException;
+            // returning early skipped that, so a full disk or a cancelled
+            // materialize crossed the binder as an IOException instead.
+            return try {
+                openForWrite(ctx, id, effectiveMode, signal)
+            } catch (e: FileNotFoundException) {
+                throw e
+            } catch (e: UnsupportedOperationException) {
+                throw e
+            } catch (e: CancellationException) {
+                throw FileNotFoundException("openDocument $id cancelled").apply { initCause(e) }
+            } catch (e: Exception) {
+                Log.w(TAG, "openForWrite $id failed", e)
+                throw FileNotFoundException("openForWrite failed: ${e.message}").apply { initCause(e) }
+            }
         }
         if (effectiveMode != "r") {
             throw UnsupportedOperationException("Unsupported mode=$effectiveMode")
@@ -777,6 +794,10 @@ class InternxtDocumentsProvider : DocumentsProvider() {
      * lands in a temp file and the upload runs from the close callback.
      * That also gives the descriptor the seekability a pipe cannot offer,
      * which "rw" requires.
+     *
+     * Everything that can fail is checked here rather than at close time,
+     * because after close() the client has already been told the save
+     * succeeded and no error can reach it.
      */
     private fun openExistingForWrite(
         ctx: Context,
@@ -788,28 +809,22 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         if (mode !in SUPPORTED_WRITE_MODES) {
             throw UnsupportedOperationException("Unsupported mode=$mode")
         }
-        if (!claimEdit(fileUuid)) {
-            throw FileNotFoundException("Document is already open for writing: $documentId")
-        }
-        try {
-            return openExistingForWriteLocked(ctx, documentId, fileUuid, mode, signal)
-        } catch (t: Throwable) {
-            activeEdits.remove(fileUuid)
-            throw t
-        }
-    }
-
-    private fun openExistingForWriteLocked(
-        ctx: Context,
-        documentId: String,
-        fileUuid: String,
-        mode: String,
-        signal: CancellationSignal?,
-    ): ParcelFileDescriptor {
         val cfg = authManager?.loadAuthConfig() ?: throw FileNotFoundException(NOT_AUTHENTICATED)
         if (cfg.mnemonic.isBlank()) {
             throw FileNotFoundException("Stored credentials have no mnemonic; sign out and back in")
         }
+
+        val api = InternxtApiClient(cfg)
+        val file = try {
+            api.getFile(fileUuid) ?: throw FileNotFoundException("File not found: $fileUuid")
+        } catch (e: InternxtApiException) {
+            throw FileNotFoundException("getFile $fileUuid failed: ${e.message}")
+        }
+        // The API only populates `bucket` on the root folder, so the same
+        // fallback the create path uses in resolveBucket applies here.
+        val bucketId = file.bucket
+            ?: rootBucket(api)
+            ?: throw FileNotFoundException("File $fileUuid has no bucket")
 
         val editToken = editTokenFor(fileUuid)
         // One call, because tempPaths() embeds nanoTime: asking twice would
@@ -821,59 +836,57 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             // one, so the current contents must be materialized first.
             runBlockingIo {
                 signal?.setOnCancelListener { coroutineContext.cancel() }
-                materializeForEdit(ctx, documentId, fileUuid, cfg, edit)
+                materializeForEdit(ctx, documentId, file, cfg, edit)
             }
         } else {
             edit.delete()
         }
 
-        val job = AtomicReference<Job?>(null)
-        signal?.setOnCancelListener { job.get()?.cancel() }
         return ParcelFileDescriptor.open(edit, ParcelFileDescriptor.parseMode(mode), closeHandler) { clientError ->
-            job.set(
-                uploadScope.launch {
-                    runReplace(ctx, documentId, fileUuid, cfg, edit, tempEnc, editToken, clientError)
-                }
-            )
+            uploadScope.launch {
+                runReplace(ctx, documentId, fileUuid, bucketId, cfg, edit, tempEnc, editToken, clientError)
+            }
         }
     }
 
     /**
-     * Android's parseMode truncates for "w" and for any mode containing 't'.
-     * "rw" and the append modes keep what is already in the file, so those are
-     * the ones that have to start from the current contents.
+     * A mode that truncates starts the edit from nothing; anything else means
+     * the client expects to see what is already there.
+     *
+     * Asked of the platform rather than restated: `parseMode` is the authority
+     * on which modes truncate, and a second encoding of that table here could
+     * only ever drift from it.
      */
     private fun modeKeepsExistingContent(mode: String): Boolean =
-        !(mode == "w" || mode.contains('t'))
+        (ParcelFileDescriptor.parseMode(mode) and ParcelFileDescriptor.MODE_TRUNCATE) == 0
 
     private suspend fun materializeForEdit(
         ctx: Context,
         documentId: String,
-        fileUuid: String,
+        file: DriveFile,
         cfg: AuthConfig,
         edit: File,
     ) {
-        val api = InternxtApiClient(cfg)
-        val file = try {
-            api.getFile(fileUuid) ?: throw FileNotFoundException("File not found: $fileUuid")
-        } catch (e: InternxtApiException) {
-            throw FileNotFoundException("getFile $fileUuid failed: ${e.message}")
-        }
-        val contentsId = file.fileId
-        if (file.size == 0L || contentsId == null) {
-            // A zero-length file has no bucket contents to fetch, and the server
-            // contract allows it to carry no contents id at all. Start the edit
-            // from an empty file rather than failing the open.
+        if (file.size == 0L) {
+            // A zero-length file has no bucket contents to fetch. Start the
+            // edit from an empty file rather than failing the open.
             edit.delete()
             edit.parentFile?.mkdirs()
             edit.createNewFile()
             return
         }
+        // A non-empty file with no contents id is metadata this client cannot
+        // interpret. Handing back an empty file here would make the client
+        // save it over the real one, so this fails the open instead. The read
+        // path in requireFileMetadata refuses the same input.
+        val contentsId = file.fileId
+            ?: throw FileNotFoundException("File ${file.uuid} has no fileId")
         val meta = FileMetadata(
-            bucket = file.bucket ?: throw FileNotFoundException("File $fileUuid has no bucket"),
+            bucket = file.bucket ?: throw FileNotFoundException("File ${file.uuid} has no bucket"),
             fileId = contentsId,
-            updatedAt = file.updatedAt ?: throw FileNotFoundException("File $fileUuid has no updatedAt"),
+            updatedAt = file.updatedAt ?: throw FileNotFoundException("File ${file.uuid} has no updatedAt"),
         )
+        val api = InternxtApiClient(cfg)
         val cacheFile = DocumentCache.cacheFileFor(ctx, documentId, meta.updatedAt)
         if (!cacheFile.exists() || cacheFile.length() == 0L) {
             materializeIntoCache(ctx, documentId, api, cfg.mnemonic, meta, cacheFile)
@@ -885,11 +898,15 @@ class InternxtDocumentsProvider : DocumentsProvider() {
      * Encrypt and upload the finished edit, then point the existing drive row at
      * the new contents. The file keeps its uuid, so document ids and permission
      * grants held by other apps survive the write.
+     *
+     * Replacements of one file are serialised. Two clients saving at once would
+     * otherwise race, and the slower upload could land on top of the newer one.
      */
     private suspend fun runReplace(
         ctx: Context,
         documentId: String,
         fileUuid: String,
+        bucketId: String,
         cfg: AuthConfig,
         edit: File,
         tempEnc: File,
@@ -901,22 +918,42 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             // the stored version, so this is a discard and not an upload.
             Log.w(TAG, "edit of $documentId closed with error, not replacing: ${clientError.message}")
             deleteTempQuietly(edit)
-            activeEdits.remove(fileUuid)
+            deleteTempQuietly(tempEnc)
             return
         }
 
+        editLocks.computeIfAbsent(fileUuid) { Mutex() }.withLock {
+            replaceUnderLock(ctx, documentId, fileUuid, bucketId, cfg, edit, tempEnc, editToken)
+        }
+    }
+
+    private suspend fun replaceUnderLock(
+        ctx: Context,
+        documentId: String,
+        fileUuid: String,
+        bucketId: String,
+        cfg: AuthConfig,
+        edit: File,
+        tempEnc: File,
+        editToken: String,
+    ) {
         val displayName = documentRows[fileUuid]
             ?.get(Document.COLUMN_DISPLAY_NAME) as? String
             ?: fileUuid
-        UploadForegroundService.start(ctx, editToken, displayName, CancellationSignal())
+        val replaceJob = coroutineContext[Job]
+        val replaceSignal = CancellationSignal()
+        replaceSignal.setOnCancelListener { replaceJob?.cancel() }
 
         var failure: Throwable? = null
         try {
+            // A background foreground-service start can be refused on API 31+,
+            // and this runs from a close callback, by which time the client may
+            // already be gone. Losing the progress notification must not take
+            // the upload or the temp files with it.
+            runCatching { UploadForegroundService.start(ctx, editToken, displayName, replaceSignal) }
+                .onFailure { Log.w(TAG, "progress notification unavailable: ${it.message}") }
+
             val api = InternxtApiClient(cfg)
-            val current = api.getFile(fileUuid)
-                ?: throw FileNotFoundException("File not found: $fileUuid")
-            val bucketId = current.bucket
-                ?: throw FileNotFoundException("File $fileUuid has no bucket")
             // An emptied file has no contents to upload, and the server contract
             // forbids sending a contents id when the size is zero.
             var newFileId: String? = null
@@ -928,9 +965,15 @@ class InternxtDocumentsProvider : DocumentsProvider() {
                 newFileId = finishBucketUpload(api, bucketId, crypto.indexHex, outcome)
                 newSize = encrypted.size
             }
-            api.replaceFileContent(fileUuid, newFileId, newSize, Instant.now().toString())
+            val updated = api.replaceFileContent(fileUuid, newFileId, newSize, Instant.now().toString())
+
             documentRows.evict(fileUuid)
             notifyDocument(documentId)
+            // The listing a picker is watching is the parent's, not this
+            // document's, so the folder would otherwise keep showing the old
+            // size and timestamp.
+            updated.folderUuid?.let { invalidateChildren(DocumentId.encodeFolder(it)) }
+            promoteEditIntoCache(ctx, documentId, edit, updated)
         } catch (t: Throwable) {
             if (!isCancellation(t)) {
                 Log.w(TAG, "replace failed uuid=$fileUuid: ${t.javaClass.simpleName}: ${t.message}")
@@ -938,35 +981,48 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             failure = t
         } finally {
             if (failure != null && !isCancellation(failure)) {
-                // close() has already returned success to the client, so these
-                // bytes are the only copy of what the user saved: the drive
-                // still holds the previous version. Deleting here would discard
-                // their work silently. The failure reaches them through the
-                // upload notification.
-                Log.e(TAG, "replace failed, preserving the edit at ${edit.absolutePath}", failure)
+                preserveFailedEdit(ctx, fileUuid, edit, failure)
             } else {
                 deleteTempQuietly(edit)
             }
             deleteTempQuietly(tempEnc)
-            activeEdits.remove(fileUuid)
             notifyServiceOfOutcome(ctx, editToken, failure)
         }
     }
 
     /**
-     * Claim the sole write slot for a file.
+     * The bytes just uploaded ARE the file now, so park them under the server's
+     * new `updatedAt` and drop the pre-edit copy.
      *
-     * The claim is released when the descriptor closes, but a client that opens
-     * one and never closes it would otherwise leave the document unwritable
-     * until the process restarts, so a claim older than the timeout can be
-     * taken over. Same reasoning as PENDING_UPLOAD_TTL_MS for pending uploads.
+     * Without this the stale entry survives, and if the server does not bump
+     * `updatedAt` the next read recomputes the same cache name, finds the old
+     * file and serves the pre-edit contents: the save would look lost.
      */
-    private fun claimEdit(fileUuid: String): Boolean {
-        val now = System.currentTimeMillis()
-        while (true) {
-            val prior = activeEdits.putIfAbsent(fileUuid, now) ?: return true
-            if (now - prior < EDIT_CLAIM_TTL_MS) return false
-            if (activeEdits.replace(fileUuid, prior, now)) return true
+    private fun promoteEditIntoCache(ctx: Context, documentId: String, edit: File, updated: DriveFile) {
+        val fresh = updated.updatedAt ?: return
+        val promoted = DocumentCache.cacheFileFor(ctx, documentId, fresh)
+        if (edit.renameTo(promoted)) {
+            DocumentCache.pruneSiblings(ctx, documentId, promoted)
+        }
+    }
+
+    /**
+     * Keep the bytes of a save that failed after close() already reported
+     * success. The drive still holds the previous version, so this copy is the
+     * only record of the user's work.
+     *
+     * Best effort, and deliberately limited: the file is moved out of the cache
+     * directory so Android will not reclaim it, but nothing retries it
+     * automatically and no UI exposes it. A durable retry queue is the real
+     * answer and is a behaviour decision rather than part of this fix.
+     */
+    private fun preserveFailedEdit(ctx: Context, fileUuid: String, edit: File, failure: Throwable) {
+        val dir = File(ctx.filesDir, FAILED_EDITS_DIR).apply { mkdirs() }
+        val kept = File(dir, "${fileUuid}_${System.currentTimeMillis()}$FAILED_EDIT_SUFFIX")
+        if (edit.renameTo(kept)) {
+            Log.e(TAG, "replace failed; kept the unsent edit at ${kept.absolutePath}", failure)
+        } else {
+            Log.e(TAG, "replace failed and the edit could not be kept: ${edit.absolutePath}", failure)
         }
     }
 
@@ -1326,9 +1382,12 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         // Android's parseMode accepts exactly these write modes. Validating up
         // front avoids authenticating and downloading for a mode that would
         // then be rejected.
+        // parseMode accepts exactly these write modes. Validating up front
+        // avoids authenticating and downloading for a mode it would reject.
         private val SUPPORTED_WRITE_MODES = setOf("w", "wt", "wa", "rw", "rwt")
 
-        private const val EDIT_CLAIM_TTL_MS = 60L * 60L * 1000L
+        private const val FAILED_EDITS_DIR = "internxt_failed_edits"
+        private const val FAILED_EDIT_SUFFIX = ".unsent"
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,
