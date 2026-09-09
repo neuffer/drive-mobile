@@ -29,6 +29,34 @@ class DocumentRowBuilderTest {
     )
 
     @Test
+    fun fileRowsAdvertiseWrite() {
+        val flags = DocumentRowBuilder.fileRow(driveFile(REPORT_PDF, "pdf"))[Document.COLUMN_FLAGS] as Int
+        assertEquals(
+            "file rows must advertise write support",
+            Document.FLAG_SUPPORTS_WRITE,
+            flags and Document.FLAG_SUPPORTS_WRITE,
+        )
+    }
+
+    @Test
+    fun folderRowsDoNotAdvertiseWrite() {
+        val folder = DriveFolder(
+            uuid = "folder-uuid",
+            plainName = "Documents",
+            parentUuid = PARENT_UUID,
+            bucket = null,
+            createdAt = null,
+            updatedAt = UPDATED_AT,
+        )
+        val flags = DocumentRowBuilder.folderRow(folder)[Document.COLUMN_FLAGS] as Int
+        assertEquals(
+            "a directory is not itself writable through openDocument",
+            0,
+            flags and Document.FLAG_SUPPORTS_WRITE,
+        )
+    }
+
+    @Test
     fun folderRowFields() {
         val folder = DriveFolder(
             uuid = "folder-uuid",

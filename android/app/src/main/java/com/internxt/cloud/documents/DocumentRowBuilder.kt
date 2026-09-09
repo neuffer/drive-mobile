@@ -15,7 +15,11 @@ object DocumentRowBuilder {
 
     private const val FOLDER_FLAGS_BASIC = Document.FLAG_DIR_SUPPORTS_CREATE
     private const val FOLDER_FLAGS = FOLDER_FLAGS_BASIC or MUTATION_FLAGS
-    private const val FILE_FLAGS = MUTATION_FLAGS
+
+    // Files are writable: openDocument() accepts the w modes for an existing
+    // document and replaces its contents on close. Without this flag a client
+    // that checks DocumentFile.canWrite() refuses to save before it ever asks.
+    private const val FILE_FLAGS = MUTATION_FLAGS or Document.FLAG_SUPPORTS_WRITE
 
     const val COLUMN_PARENT_UUID = "internxt_parent_uuid"
 
