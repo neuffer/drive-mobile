@@ -341,7 +341,8 @@ class InternxtApiClient(
         folderUuid = obj.optStringOrNull("folderUuid"),
         createdAt = obj.optStringOrNull("createdAt"),
         updatedAt = obj.optStringOrNull("updatedAt"),
-        fileId = obj.optStringOrNull("fileId")
+        fileId = obj.optStringOrNull("fileId"),
+        status = obj.optStringOrNull("status")
     )
 
     companion object {

@@ -820,6 +820,15 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         } catch (e: InternxtApiException) {
             throw FileNotFoundException("getFile $fileUuid failed: ${e.message}")
         }
+        // The server refuses to replace anything that is not EXISTS, and the
+        // meta endpoint does NOT filter by status, so a trashed file opens
+        // happily and only fails at close, by which time the client has been
+        // told the save succeeded. Refuse it while the error can still be
+        // reported. An absent status means an older response shape, not a
+        // trashed file, so it is allowed through.
+        if (file.status != null && file.status != FILE_STATUS_EXISTS) {
+            throw FileNotFoundException("${file.status} files cannot be replaced: $documentId")
+        }
         // The API only populates `bucket` on the root folder, so the same
         // fallback the create path uses in resolveBucket applies here.
         val bucketId = file.bucket
@@ -962,6 +971,10 @@ class InternxtDocumentsProvider : DocumentsProvider() {
                 val crypto = prepareEncryption(cfg.mnemonic, bucketId)
                 val encrypted = EncryptedFileUploader.encryptFile(edit, tempEnc, crypto.key, crypto.iv)
                 val outcome = uploadEncryptedFile(editToken, api, tempEnc, bucketId, encrypted)
+                // The server rejects a replace that re-declares the current
+                // contents id. It cannot happen here: prepareEncryption draws a
+                // fresh random index every time, so the ciphertext, its hash and
+                // therefore the bucket id all differ even for identical input.
                 newFileId = finishBucketUpload(api, bucketId, crypto.indexHex, outcome)
                 newSize = encrypted.size
             }
@@ -1385,6 +1398,8 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         // parseMode accepts exactly these write modes. Validating up front
         // avoids authenticating and downloading for a mode it would reject.
         private val SUPPORTED_WRITE_MODES = setOf("w", "wt", "wa", "rw", "rwt")
+
+        private const val FILE_STATUS_EXISTS = "EXISTS"
 
         private const val FAILED_EDITS_DIR = "internxt_failed_edits"
         private const val FAILED_EDIT_SUFFIX = ".unsent"

@@ -344,6 +344,22 @@ class InternxtApiClientTest {
     }
 
     @Test
+    fun getFileCarriesStatusThrough() {
+        enqueueJson("""{"uuid":"$FILE_UUID_1","status":"TRASHED"}""")
+
+        // The write path refuses a non-EXISTS file at open, which it can only
+        // do if the status survives parsing.
+        assertEquals("TRASHED", client.getFile(FILE_UUID_1)?.status)
+    }
+
+    @Test
+    fun getFileToleratesAnAbsentStatus() {
+        enqueueJson("""{"uuid":"$FILE_UUID_1"}""")
+
+        assertNull(client.getFile(FILE_UUID_1)?.status)
+    }
+
+    @Test
     fun replaceFileContentPutsFileIdAndSizeToFileEndpoint() {
         enqueueJson("""{"uuid":"$FILE_UUID_1","folderUuid":"$PARENT_UUID"}""")
 
