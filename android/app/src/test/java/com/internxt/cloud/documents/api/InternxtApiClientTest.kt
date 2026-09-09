@@ -6,6 +6,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Before
@@ -340,6 +341,34 @@ class InternxtApiClientTest {
         assertEquals("PUT", recorded.method)
         assertEquals("/folders/$FOLDER_UUID_1/meta", recorded.path)
         assertEquals("Renamed", JSONObject(recorded.body.readUtf8()).getString("plainName"))
+    }
+
+    @Test
+    fun replaceFileContentPutsFileIdAndSizeToFileEndpoint() {
+        enqueueJson("""{"uuid":"$FILE_UUID_1","folderUuid":"$PARENT_UUID"}""")
+
+        client.replaceFileContent(FILE_UUID_1, "new-content-id", 4096L)
+
+        val recorded = server.takeRequest()
+        // PUT /files/{uuid} is replaceFile. PUT /files/{uuid}/meta would rename
+        // instead, and PATCH /files/{uuid} would move, so the verb and the
+        // absence of a /meta suffix are both load-bearing.
+        assertEquals("PUT", recorded.method)
+        assertEquals("/files/$FILE_UUID_1", recorded.path)
+        val body = JSONObject(recorded.body.readUtf8())
+        assertEquals("new-content-id", body.getString("fileId"))
+        assertEquals(4096L, body.getLong("size"))
+        assertFalse("modificationTime must be omitted when not supplied", body.has("modificationTime"))
+    }
+
+    @Test
+    fun replaceFileContentSendsModificationTimeWhenGiven() {
+        enqueueJson("""{"uuid":"$FILE_UUID_1"}""")
+
+        client.replaceFileContent(FILE_UUID_1, "new-content-id", 1L, "2026-01-11T00:00:00.000Z")
+
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals("2026-01-11T00:00:00.000Z", body.getString("modificationTime"))
     }
 
     @Test

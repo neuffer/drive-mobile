@@ -174,6 +174,36 @@ class InternxtApiClient(
         return UploadFinishResponse(id = id, bucket = body.optStringOrNull("bucket"))
     }
 
+    /**
+     * Replace the contents of an existing drive file.
+     *
+     * PUT /files/{uuid} is the server's replaceFile route (PUT /files/{uuid}/meta
+     * renames, PATCH /files/{uuid} moves). The file keeps its uuid, so every
+     * SAF document id, permission grant and client-side reference stays valid.
+     *
+     * @param fileUuid the drive file whose contents are replaced.
+     * @param fileId the bucket contents id just returned by finishUpload.
+     * @param size encrypted size, matching what createFileEntry records.
+     * @param modificationTime optional ISO-8601 timestamp.
+     * @return the updated file as the server now holds it.
+     * @throws InternxtApiException on any non-2xx response.
+     */
+    fun replaceFileContent(
+        fileUuid: String,
+        fileId: String,
+        size: Long,
+        modificationTime: String? = null,
+    ): DriveFile {
+        val payload = JSONObject()
+            .put("fileId", fileId)
+            .put("size", size)
+        modificationTime?.let { payload.put("modificationTime", it) }
+        val req = driveRequest(driveUrl("files/$fileUuid"))
+            .put(payload.toString().toRequestBody(JSON))
+            .build()
+        return parseFile(executeApiRequest(req))
+    }
+
     fun createFileEntry(entry: CreateFileEntry): DriveFile {
         val payload = JSONObject()
             .put("fileId", entry.fileId)
