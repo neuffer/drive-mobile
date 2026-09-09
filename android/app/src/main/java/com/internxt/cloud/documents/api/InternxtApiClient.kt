@@ -182,7 +182,8 @@ class InternxtApiClient(
      * SAF document id, permission grant and client-side reference stays valid.
      *
      * @param fileUuid the drive file whose contents are replaced.
-     * @param fileId the bucket contents id just returned by finishUpload.
+     * @param fileId the bucket contents id just returned by finishUpload, or
+     *   null for an emptied file, which the server requires to carry none.
      * @param size encrypted size, matching what createFileEntry records.
      * @param modificationTime optional ISO-8601 timestamp.
      * @return the updated file as the server now holds it.
@@ -190,13 +191,18 @@ class InternxtApiClient(
      */
     fun replaceFileContent(
         fileUuid: String,
-        fileId: String,
+        fileId: String?,
         size: Long,
         modificationTime: String? = null,
     ): DriveFile {
-        val payload = JSONObject()
-            .put("fileId", fileId)
-            .put("size", size)
+        // The server requires fileId when size > 0 and forbids it when size is
+        // 0, so the two travel together or the request is rejected.
+        require(size >= 0L) { "size must be >= 0" }
+        require((size == 0L) == (fileId == null)) {
+            "fileId must be null exactly when size is zero"
+        }
+        val payload = JSONObject().put("size", size)
+        fileId?.let { payload.put("fileId", it) }
         modificationTime?.let { payload.put("modificationTime", it) }
         val req = driveRequest(driveUrl("files/$fileUuid"))
             .put(payload.toString().toRequestBody(JSON))

@@ -65,6 +65,13 @@ class InternxtDocumentsProvider : DocumentsProvider() {
 
     private val folderLoads = ConcurrentHashMap<String, FolderLoad>()
     private val documentRows = DocumentRowCache()
+
+    /**
+     * Documents currently open for writing, keyed by file uuid. Two writers on
+     * one file race: whichever replaces last wins, so a slow save can land on
+     * top of a newer one. Admitting one at a time removes that.
+     */
+    private val activeEdits = ConcurrentHashMap<String, Long>()
     private val pendingUploads = ConcurrentHashMap<String, PendingUpload>()
 
     @Volatile private var cachedRootBucket: String? = null
@@ -778,6 +785,27 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         mode: String,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
+        if (mode !in SUPPORTED_WRITE_MODES) {
+            throw UnsupportedOperationException("Unsupported mode=$mode")
+        }
+        if (!claimEdit(fileUuid)) {
+            throw FileNotFoundException("Document is already open for writing: $documentId")
+        }
+        try {
+            return openExistingForWriteLocked(ctx, documentId, fileUuid, mode, signal)
+        } catch (t: Throwable) {
+            activeEdits.remove(fileUuid)
+            throw t
+        }
+    }
+
+    private fun openExistingForWriteLocked(
+        ctx: Context,
+        documentId: String,
+        fileUuid: String,
+        mode: String,
+        signal: CancellationSignal?,
+    ): ParcelFileDescriptor {
         val cfg = authManager?.loadAuthConfig() ?: throw FileNotFoundException(NOT_AUTHENTICATED)
         if (cfg.mnemonic.isBlank()) {
             throw FileNotFoundException("Stored credentials have no mnemonic; sign out and back in")
@@ -826,10 +854,29 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         edit: File,
     ) {
         val api = InternxtApiClient(cfg)
-        val file = requireFileMetadata(api, fileUuid)
-        val cacheFile = DocumentCache.cacheFileFor(ctx, documentId, file.updatedAt)
+        val file = try {
+            api.getFile(fileUuid) ?: throw FileNotFoundException("File not found: $fileUuid")
+        } catch (e: InternxtApiException) {
+            throw FileNotFoundException("getFile $fileUuid failed: ${e.message}")
+        }
+        val contentsId = file.fileId
+        if (file.size == 0L || contentsId == null) {
+            // A zero-length file has no bucket contents to fetch, and the server
+            // contract allows it to carry no contents id at all. Start the edit
+            // from an empty file rather than failing the open.
+            edit.delete()
+            edit.parentFile?.mkdirs()
+            edit.createNewFile()
+            return
+        }
+        val meta = FileMetadata(
+            bucket = file.bucket ?: throw FileNotFoundException("File $fileUuid has no bucket"),
+            fileId = contentsId,
+            updatedAt = file.updatedAt ?: throw FileNotFoundException("File $fileUuid has no updatedAt"),
+        )
+        val cacheFile = DocumentCache.cacheFileFor(ctx, documentId, meta.updatedAt)
         if (!cacheFile.exists() || cacheFile.length() == 0L) {
-            materializeIntoCache(ctx, documentId, api, cfg.mnemonic, file, cacheFile)
+            materializeIntoCache(ctx, documentId, api, cfg.mnemonic, meta, cacheFile)
         }
         cacheFile.copyTo(edit, overwrite = true)
     }
@@ -854,6 +901,7 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             // the stored version, so this is a discard and not an upload.
             Log.w(TAG, "edit of $documentId closed with error, not replacing: ${clientError.message}")
             deleteTempQuietly(edit)
+            activeEdits.remove(fileUuid)
             return
         }
 
@@ -865,12 +913,22 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         var failure: Throwable? = null
         try {
             val api = InternxtApiClient(cfg)
-            val bucketId = requireFileMetadata(api, fileUuid).bucket
-            val crypto = prepareEncryption(cfg.mnemonic, bucketId)
-            val encrypted = EncryptedFileUploader.encryptFile(edit, tempEnc, crypto.key, crypto.iv)
-            val outcome = uploadEncryptedFile(editToken, api, tempEnc, bucketId, encrypted)
-            val newFileId = finishBucketUpload(api, bucketId, crypto.indexHex, outcome)
-            api.replaceFileContent(fileUuid, newFileId, encrypted.size, Instant.now().toString())
+            val current = api.getFile(fileUuid)
+                ?: throw FileNotFoundException("File not found: $fileUuid")
+            val bucketId = current.bucket
+                ?: throw FileNotFoundException("File $fileUuid has no bucket")
+            // An emptied file has no contents to upload, and the server contract
+            // forbids sending a contents id when the size is zero.
+            var newFileId: String? = null
+            var newSize = 0L
+            if (edit.length() > 0L) {
+                val crypto = prepareEncryption(cfg.mnemonic, bucketId)
+                val encrypted = EncryptedFileUploader.encryptFile(edit, tempEnc, crypto.key, crypto.iv)
+                val outcome = uploadEncryptedFile(editToken, api, tempEnc, bucketId, encrypted)
+                newFileId = finishBucketUpload(api, bucketId, crypto.indexHex, outcome)
+                newSize = encrypted.size
+            }
+            api.replaceFileContent(fileUuid, newFileId, newSize, Instant.now().toString())
             documentRows.evict(fileUuid)
             notifyDocument(documentId)
         } catch (t: Throwable) {
@@ -879,13 +937,40 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             }
             failure = t
         } finally {
-            deleteTempQuietly(edit)
+            if (failure != null && !isCancellation(failure)) {
+                // close() has already returned success to the client, so these
+                // bytes are the only copy of what the user saved: the drive
+                // still holds the previous version. Deleting here would discard
+                // their work silently. The failure reaches them through the
+                // upload notification.
+                Log.e(TAG, "replace failed, preserving the edit at ${edit.absolutePath}", failure)
+            } else {
+                deleteTempQuietly(edit)
+            }
             deleteTempQuietly(tempEnc)
+            activeEdits.remove(fileUuid)
             notifyServiceOfOutcome(ctx, editToken, failure)
         }
     }
 
-    private fun editTokenFor(fileUuid: String) = "$EDIT_TOKEN_PREFIX$fileUuid"
+    /**
+     * Claim the sole write slot for a file.
+     *
+     * The claim is released when the descriptor closes, but a client that opens
+     * one and never closes it would otherwise leave the document unwritable
+     * until the process restarts, so a claim older than the timeout can be
+     * taken over. Same reasoning as PENDING_UPLOAD_TTL_MS for pending uploads.
+     */
+    private fun claimEdit(fileUuid: String): Boolean {
+        val now = System.currentTimeMillis()
+        while (true) {
+            val prior = activeEdits.putIfAbsent(fileUuid, now) ?: return true
+            if (now - prior < EDIT_CLAIM_TTL_MS) return false
+            if (activeEdits.replace(fileUuid, prior, now)) return true
+        }
+    }
+
+    private fun editTokenFor(fileUuid: String) = "$EDIT_TOKEN_PREFIX${fileUuid}_${UUID.randomUUID()}"
 
     private suspend fun runUpload(
         ctx: Context,
@@ -1237,6 +1322,13 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         // Namespaces the temp files and the progress-notification token for an
         // edit, so they cannot collide with a pending upload of the same uuid.
         private const val EDIT_TOKEN_PREFIX = "edit_"
+
+        // Android's parseMode accepts exactly these write modes. Validating up
+        // front avoids authenticating and downloading for a mode that would
+        // then be rejected.
+        private val SUPPORTED_WRITE_MODES = setOf("w", "wt", "wa", "rw", "rwt")
+
+        private const val EDIT_CLAIM_TTL_MS = 60L * 60L * 1000L
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,

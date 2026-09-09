@@ -362,6 +362,28 @@ class InternxtApiClientTest {
     }
 
     @Test
+    fun replaceFileContentOmitsFileIdForAnEmptiedFile() {
+        enqueueJson("""{"uuid":"$FILE_UUID_1"}""")
+
+        client.replaceFileContent(FILE_UUID_1, null, 0L)
+
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals(0L, body.getLong("size"))
+        // The server forbids a contents id when the size is zero.
+        assertFalse("fileId must be absent when size is 0", body.has("fileId"))
+    }
+
+    @Test
+    fun replaceFileContentRejectsAContradictoryPairing() {
+        assertThrows(IllegalArgumentException::class.java) {
+            client.replaceFileContent(FILE_UUID_1, "content-id", 0L)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            client.replaceFileContent(FILE_UUID_1, null, 10L)
+        }
+    }
+
+    @Test
     fun replaceFileContentSendsModificationTimeWhenGiven() {
         enqueueJson("""{"uuid":"$FILE_UUID_1"}""")
 
