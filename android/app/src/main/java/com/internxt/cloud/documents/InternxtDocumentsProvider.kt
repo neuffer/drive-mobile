@@ -43,6 +43,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -394,6 +395,13 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             ?: api.getFile(documentId)?.let { DocumentId.Kind.FILE }
     }
 
+    private fun notifyDocument(documentId: String) {
+        context?.contentResolver?.notifyChange(
+            DocumentsContract.buildDocumentUri(AUTHORITY, documentId),
+            null,
+        )
+    }
+
     private fun notifyChildren(parentDocumentId: String) {
         context?.contentResolver?.notifyChange(
             DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId),
@@ -501,8 +509,8 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         val ctx = context ?: throw FileNotFoundException("No context")
         val id = documentId ?: throw FileNotFoundException("No document id")
         val effectiveMode = mode ?: "r"
-        if (effectiveMode.contains('w')) {
-            return openForWrite(ctx, id, signal)
+        if (effectiveMode.contains('w') || effectiveMode.contains('a')) {
+            return openForWrite(ctx, id, effectiveMode, signal)
         }
         if (effectiveMode != "r") {
             throw UnsupportedOperationException("Unsupported mode=$effectiveMode")
@@ -713,10 +721,24 @@ class InternxtDocumentsProvider : DocumentsProvider() {
     private fun openForWrite(
         ctx: Context,
         documentId: String,
+        mode: String,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
-        val token = DocumentId.decodeUpload(documentId)
-            ?: throw FileNotFoundException("Write only supported on pending uploads: $documentId")
+        DocumentId.decodeUpload(documentId)?.let { token ->
+            return openPendingForWrite(ctx, token, signal)
+        }
+        val decoded = DocumentId.decode(documentId)
+        if (decoded?.kind == DocumentId.Kind.FILE) {
+            return openExistingForWrite(ctx, documentId, decoded.uuid, mode, signal)
+        }
+        throw FileNotFoundException("Not a writable document: $documentId")
+    }
+
+    private fun openPendingForWrite(
+        ctx: Context,
+        token: String,
+        signal: CancellationSignal?,
+    ): ParcelFileDescriptor {
         val pending = pendingUploads[token]
             ?: throw FileNotFoundException("Unknown upload token: $token")
 
@@ -738,6 +760,132 @@ class InternxtDocumentsProvider : DocumentsProvider() {
             throw t
         }
     }
+
+    /**
+     * Open an existing drive file for writing.
+     *
+     * The pending-upload path can stream straight into the network because the
+     * bytes have nowhere else to go. An existing file cannot: the replacement
+     * only becomes safe once the client has finished writing, so the write
+     * lands in a temp file and the upload runs from the close callback.
+     * That also gives the descriptor the seekability a pipe cannot offer,
+     * which "rw" requires.
+     */
+    private fun openExistingForWrite(
+        ctx: Context,
+        documentId: String,
+        fileUuid: String,
+        mode: String,
+        signal: CancellationSignal?,
+    ): ParcelFileDescriptor {
+        val cfg = authManager?.loadAuthConfig() ?: throw FileNotFoundException(NOT_AUTHENTICATED)
+        if (cfg.mnemonic.isBlank()) {
+            throw FileNotFoundException("Stored credentials have no mnemonic; sign out and back in")
+        }
+
+        val editToken = editTokenFor(fileUuid)
+        // One call, because tempPaths() embeds nanoTime: asking twice would
+        // hand back two unrelated pairs.
+        val (tempEnc, edit) = DocumentCache.tempPaths(ctx, editToken)
+        if (modeKeepsExistingContent(mode)) {
+            // The client intends to read what is there and write back a modified
+            // version. Handing it an empty file would make it save a truncated
+            // one, so the current contents must be materialized first.
+            runBlockingIo {
+                signal?.setOnCancelListener { coroutineContext.cancel() }
+                materializeForEdit(ctx, documentId, fileUuid, cfg, edit)
+            }
+        } else {
+            edit.delete()
+        }
+
+        val job = AtomicReference<Job?>(null)
+        signal?.setOnCancelListener { job.get()?.cancel() }
+        return ParcelFileDescriptor.open(edit, ParcelFileDescriptor.parseMode(mode), closeHandler) { clientError ->
+            job.set(
+                uploadScope.launch {
+                    runReplace(ctx, documentId, fileUuid, cfg, edit, tempEnc, editToken, clientError)
+                }
+            )
+        }
+    }
+
+    /**
+     * Android's parseMode truncates for "w" and for any mode containing 't'.
+     * "rw" and the append modes keep what is already in the file, so those are
+     * the ones that have to start from the current contents.
+     */
+    private fun modeKeepsExistingContent(mode: String): Boolean =
+        !(mode == "w" || mode.contains('t'))
+
+    private suspend fun materializeForEdit(
+        ctx: Context,
+        documentId: String,
+        fileUuid: String,
+        cfg: AuthConfig,
+        edit: File,
+    ) {
+        val api = InternxtApiClient(cfg)
+        val file = requireFileMetadata(api, fileUuid)
+        val cacheFile = DocumentCache.cacheFileFor(ctx, documentId, file.updatedAt)
+        if (!cacheFile.exists() || cacheFile.length() == 0L) {
+            materializeIntoCache(ctx, documentId, api, cfg.mnemonic, file, cacheFile)
+        }
+        cacheFile.copyTo(edit, overwrite = true)
+    }
+
+    /**
+     * Encrypt and upload the finished edit, then point the existing drive row at
+     * the new contents. The file keeps its uuid, so document ids and permission
+     * grants held by other apps survive the write.
+     */
+    private suspend fun runReplace(
+        ctx: Context,
+        documentId: String,
+        fileUuid: String,
+        cfg: AuthConfig,
+        edit: File,
+        tempEnc: File,
+        editToken: String,
+        clientError: IOException?,
+    ) {
+        if (clientError != null) {
+            // The client abandoned the write. Its partial bytes must not become
+            // the stored version, so this is a discard and not an upload.
+            Log.w(TAG, "edit of $documentId closed with error, not replacing: ${clientError.message}")
+            deleteTempQuietly(edit)
+            return
+        }
+
+        val displayName = documentRows[fileUuid]
+            ?.get(Document.COLUMN_DISPLAY_NAME) as? String
+            ?: fileUuid
+        UploadForegroundService.start(ctx, editToken, displayName, CancellationSignal())
+
+        var failure: Throwable? = null
+        try {
+            val api = InternxtApiClient(cfg)
+            val bucketId = requireFileMetadata(api, fileUuid).bucket
+            val crypto = prepareEncryption(cfg.mnemonic, bucketId)
+            val encrypted = EncryptedFileUploader.encryptFile(edit, tempEnc, crypto.key, crypto.iv)
+            val outcome = uploadEncryptedFile(editToken, api, tempEnc, bucketId, encrypted)
+            val newFileId = finishBucketUpload(api, bucketId, crypto.indexHex, outcome)
+            api.replaceFileContent(fileUuid, newFileId, encrypted.size, Instant.now().toString())
+            documentRows.evict(fileUuid)
+            notifyDocument(documentId)
+        } catch (t: Throwable) {
+            if (!isCancellation(t)) {
+                Log.w(TAG, "replace failed uuid=$fileUuid: ${t.javaClass.simpleName}: ${t.message}")
+            }
+            failure = t
+        } finally {
+            deleteTempQuietly(edit)
+            deleteTempQuietly(tempEnc)
+            notifyServiceOfOutcome(ctx, editToken, failure)
+        }
+    }
+
+    private fun editTokenFor(fileUuid: String) = "$EDIT_TOKEN_PREFIX$fileUuid"
 
     private suspend fun runUpload(
         ctx: Context,
@@ -903,14 +1051,17 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    private fun finalizeAndRecordFile(
+    /**
+     * Commit the bucket upload and return the new contents id. Shared by the
+     * create path, which then posts a new drive row, and the replace path,
+     * which points an existing row at it.
+     */
+    private fun finishBucketUpload(
         api: InternxtApiClient,
-        pending: PendingUpload,
         bucketId: String,
         indexHex: String,
-        encryptedSize: Long,
         outcome: UploadOutcome,
-    ) {
+    ): String {
         val hash = EncryptedFileUploader.computeShardHash(outcome.partHashes)
         val shard = when (outcome) {
             is UploadOutcome.Single -> FinishUploadShard(uuid = outcome.slotUuid, hash = hash)
@@ -921,13 +1072,24 @@ class InternxtDocumentsProvider : DocumentsProvider() {
                 parts = outcome.parts,
             )
         }
-        val finish = api.finishUpload(bucketId, indexHex, listOf(shard))
+        return api.finishUpload(bucketId, indexHex, listOf(shard)).id
+    }
+
+    private fun finalizeAndRecordFile(
+        api: InternxtApiClient,
+        pending: PendingUpload,
+        bucketId: String,
+        indexHex: String,
+        encryptedSize: Long,
+        outcome: UploadOutcome,
+    ) {
+        val newFileId = finishBucketUpload(api, bucketId, indexHex, outcome)
 
         val nowIso = Instant.now().toString()
         val (basePlain, ext) = DocumentNaming.splitNameExt(pending.plainName)
         api.createFileEntry(
             CreateFileEntry(
-                fileId = finish.id,
+                fileId = newFileId,
                 type = ext.removePrefix("."),
                 size = encryptedSize,
                 plainName = basePlain,
@@ -1071,6 +1233,10 @@ class InternxtDocumentsProvider : DocumentsProvider() {
         private const val PROGRESS_THROTTLE_MS = 300L
         private const val PENDING_UPLOAD_TTL_MS = 60L * 60L * 1000L
         private const val NOT_AUTHENTICATED = "Not authenticated"
+
+        // Namespaces the temp files and the progress-notification token for an
+        // edit, so they cannot collide with a pending upload of the same uuid.
+        private const val EDIT_TOKEN_PREFIX = "edit_"
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,
